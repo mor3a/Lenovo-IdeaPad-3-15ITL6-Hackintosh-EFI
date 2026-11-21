@@ -1,0 +1,156 @@
+--- a/kext/TGLDmic/DmaBuffer.hpp
++++ b/kext/TGLDmic/DmaBuffer.hpp
+@@ -19,6 +19,7 @@
+     // addresses do not work there: DMA fetched nothing). tgldmicdma=2 forces physical for testing.
+     enum Mode { kAuto = 0, kForceMapped = 1, kForcePhysical = 2 };
+     bool physical {false};
++    IOReturn lastError {kIOReturnSuccess};
+ 
+     static int modeArg() {
+         int v = 0;
+@@ -26,30 +27,44 @@
+     }
+ 
+     bool alloc(IOPCIDevice *pci, size_t bytes) {
+-        size = round_page(bytes);
++        const size_t wanted = round_page(bytes);
++        const bool wantPhysical = (modeArg() == kForcePhysical);
++        lastError = kIOReturnSuccess;
++        // Keep prepared firmware DMA memory across DSP power cycles. Never overwrite
++        // a live descriptor after a partial allocation failure.
++        if (mem && virt && iova && size >= wanted && physical == wantPhysical)
++            return true;
++        release();
++        size = wanted;
+         IOMapper *mapper = IOMapper::copyMapperForDevice(pci);
+-        int mode = modeArg();
+-        physical = (mode == kForcePhysical);
++        physical = wantPhysical;
+         IOOptionBits opts = kIODirectionInOut | kIOMemoryPhysicallyContiguous | (physical ? kIOMemoryMapperNone : 0);
+         mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, opts, size, 0x00000000FFFFF000ULL);
+-        if (!mem || mem->prepare() != kIOReturnSuccess) { OSSafeReleaseNULL(mapper); release(); return false; }
++        if (!mem) { lastError = kIOReturnNoMemory; OSSafeReleaseNULL(mapper); release(); return false; }
++        lastError = mem->prepare();
++        if (lastError != kIOReturnSuccess) { OSSafeReleaseNULL(mapper); release(); return false; }
+         virt = static_cast<uint8_t *>(mem->getBytesNoCopy());
+         bzero(virt, size);
+         if (physical) {
+             IOByteCount len = 0;
+             iova = mem->getPhysicalSegment(0, &len, kIOMemoryMapperNone);
+             OSSafeReleaseNULL(mapper);
+-            if (!iova || len < size || iova + size > 0x100000000ULL) { release(); return false; }
++            if (!iova || len < size || iova + size > 0x100000000ULL) { lastError = kIOReturnNoSpace; release(); return false; }
+             return true;
+         }
+         cmd = IODMACommand::withSpecification(kIODMACommandOutputHost64, 32, 0,
+                   IODMACommand::kMapped, 0, 1, mapper, nullptr);
+         OSSafeReleaseNULL(mapper);
+-        if (!cmd || cmd->setMemoryDescriptor(mem, true) != kIOReturnSuccess) { release(); return false; }
++        if (!cmd) { lastError = kIOReturnNoMemory; release(); return false; }
++        lastError = cmd->setMemoryDescriptor(mem, true);
++        if (lastError != kIOReturnSuccess) { release(); return false; }
+         IODMACommand::Segment64 seg {};
+         UInt64 off = 0; UInt32 n = 1;
+-        if (cmd->gen64IOVMSegments(&off, &seg, &n) != kIOReturnSuccess || n != 1 || seg.fLength < size ||
+-            seg.fIOVMAddr + size > 0x100000000ULL) { release(); return false; }
++        lastError = cmd->gen64IOVMSegments(&off, &seg, &n);
++        if (lastError != kIOReturnSuccess) { release(); return false; }
++        if (n != 1 || seg.fLength < size || seg.fIOVMAddr + size > 0x100000000ULL) {
++            lastError = kIOReturnNoSpace; release(); return false;
++        }
+         iova = seg.fIOVMAddr;
+         return true;
+     }
+--- a/kext/TGLDmic/DspBoot.cpp
++++ b/kext/TGLDmic/DspBoot.cpp
+@@ -37,6 +37,30 @@
+ constexpr uint32_t VS_DPIB_BASE = 0x1084, VS_DPIB_STRIDE = 0x20;     // DMA position in decoupled mode
+ }
+ 
++// Reserve the selected embedded firmware payload early, before a recording requests
++// DSP startup. DSP power management and firmware contents stay unchanged.
++bool TGLDmic::reserveBootBuffers() {
++    bool useCml = platformFamily == kPlatformCometLake;
++    char fwArg[16] = {};
++    if (PE_parse_boot_argn("tgldmicfw", fwArg, sizeof(fwArg))) {
++        if (strcmp(fwArg, "cml") == 0 || strcmp(fwArg, "cnl") == 0) useCml = true;
++        else if (strcmp(fwArg, "tgl") == 0) useCml = false;
++    }
++    const unsigned char *data = useCml ? kSofCmlRi : kSofTglRi;
++    size_t total = useCml ? kSofCmlRiSize : kSofTglRiSize;
++    const uint32_t *words = reinterpret_cast<const uint32_t *>(data);
++    size_t skip = words[0] == XMAN_MAGIC ? words[1] : 0;
++    if (skip >= total) return false;
++    if (!clBuf.alloc(pci, total - skip)) {
++        LOG("DMA reserve: firmware buffer failed 0x%x", clBuf.lastError); return false;
++    }
++    if (!bdlBuf.alloc(pci, 4096)) {
++        LOG("DMA reserve: BDL buffer failed 0x%x", bdlBuf.lastError); return false;
++    }
++    LOG("DMA reserve: firmware %zu bytes + BDL %zu bytes ready", clBuf.size, bdlBuf.size);
++    return true;
++}
++
+ void TGLDmic::fail(const char *what, uint32_t value) {
+     snprintf(bootResult, sizeof(bootResult), "FAIL %s (0x%08x)", what, value);
+     LOG("boot: %s", bootResult);
+@@ -298,7 +322,8 @@
+         fail("spare output stream in use by the HDA driver", idx); return false;
+     }
+ 
+-    if (!clBuf.alloc(pci, fwBytes) || !bdlBuf.alloc(pci, 4096)) { fail("DMA alloc (<4GB contiguous)", 0); return false; }
++    if (!clBuf.alloc(pci, fwBytes)) { fail("firmware DMA alloc", static_cast<uint32_t>(clBuf.lastError)); return false; }
++    if (!bdlBuf.alloc(pci, 4096)) { fail("BDL DMA alloc", static_cast<uint32_t>(bdlBuf.lastError)); return false; }
+     memcpy(clBuf.virt, fwData + skip, fwBytes);
+     {
+         IOMapper *m = IOMapper::copyMapperForDevice(pci);
+@@ -389,7 +414,9 @@
+     } while (false);
+ 
+     releaseLoaderStream(idx);
+-    clBuf.release(); bdlBuf.release();
++    // Loader DMA is stopped/reset above. Keep these buffers prepared for the
++    // next recording; release them when the driver shuts down.
++
+     if (ok) {
+         snprintf(bootResult, sizeof(bootResult), "OK FW_READY");
+         bootState = 1;
+--- a/kext/TGLDmic/TGLDmic.cpp
++++ b/kext/TGLDmic/TGLDmic.cpp
+@@ -216,6 +216,10 @@
+     uint32_t delay = 0;
+     if (PE_parse_boot_argn("tgldmicdelay", &delay, sizeof(delay)) && delay >= 10 && delay <= 170) bootDelaySec = delay;
+     keepRunning = bootArg("-tgldmickeep");
++
++    setProperty("TGLDmicLocalBuild", "dma-reserve-1");
++    if (bootRequested && !reserveBootBuffers())
++        LOG("early DMA reserve failed - boot path will retry with detailed status");
+ 
+     LOG("TGLDmic v%s on %s (Darwin %d.%d), dsp-reads=%s, dsp-boot=%s%s",
+         kTGLDmicVersionString, provider->getName(), version_major, version_minor, readDsp ? "on" : "off",
+@@ -392,6 +396,7 @@
+     if (self->bootState == 1 && self->keepRunning) self->corePowerDown();
+     self->gating(true);
+     self->releaseCaptureBuffers();
++    self->clBuf.release(); self->bdlBuf.release();
+     return kIOReturnSuccess;
+ }
+ 
+@@ -413,6 +418,7 @@
+ }
+ 
+ void TGLDmic::free() {
++    clBuf.release(); bdlBuf.release(); // also cover an early start() failure
+     OSSafeReleaseNULL(capSnap);
+     OSSafeReleaseNULL(logRing);
+     OSSafeReleaseNULL(pci);
+--- a/kext/TGLDmic/TGLDmic.hpp
++++ b/kext/TGLDmic/TGLDmic.hpp
+@@ -106,6 +106,7 @@
+     bool corePowerUp();
+     bool coreRun();
+     void corePowerDown();
++    bool reserveBootBuffers();
+     bool bootDsp();
+ 
+     // ---- Phase 3: DMIC capture test (only with -tgldmiccap, implies boot) ----
